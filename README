@@ -1,9 +1,11 @@
 lugia.
 a fast local model inference system made for mac based on mlx
 
-> build things from scratch. make your own inference engine that can support llama. Understand why and how it works. implement various architectures. Go back and read a few arxiv papers when you don't understand something and then read the citations.
-> just build stuff
+- philosopy for this project
+> build things from scratch. your own inference engine that can support mistral. Understand why and how it works. implement various architectures. Go back and read a few arxiv papers when you don't understand something and then read the citations.
 
+- goal 
+> to go from barebones mistral implementation to fully fleged DSCv2 lite implementation
 
 [x] make your inference engine support llama/mistral [4:30 AM 08/07/2024]
 [ ] implement various archs
@@ -14,9 +16,6 @@ a fast local model inference system made for mac based on mlx
 [ ] done implement big guns 
 [ ] finally get DSCv2 lite working??
 [ ] profit???
-
-goal 
-to go from barebones mistral implementation to fully fleged DSCv2 lite implemation
 
 wip notes for this 
 https://ksagar.me/blog/mistral2DSCv2
