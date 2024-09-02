@@ -2,4 +2,5 @@ mistral-7B-v0.1/
 .venv/
 logs/
 mlx_model/
+quantized-gemma-2b-it/
 __pycache__/

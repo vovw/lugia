@@ -1,24 +1,24 @@
+wip 
+
 lugia.
 a fast local model inference system made for mac based on mlx
 
-- philosopy for this project
-> build things from scratch. your own inference engine that can support mistral. Understand why and how it works. implement various architectures. Go back and read a few arxiv papers when you don't understand something and then read the citations.
 
-- goal 
-> to go from barebones mistral implementation to fully fleged DSCv2 lite implementation
 
-[x] make your inference engine support llama/mistral [4:30 AM 08/07/2024]
-[ ] implement various archs
-[ ] flash2 ??
-[ ] tpu_splash??
-[ ] MLA
-[ ] NLA
-[ ] done implement big guns 
-[ ] finally get DSCv2 lite working??
-[ ] profit???
 
-wip notes for this 
-https://ksagar.me/blog/mistral2DSCv2
+[] tooling
+[] rag
+[] tui
+[] tts
+[] sst
+[] omni?
+[] 
 
-refrence for DSCv2
-https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+
+# goals
+- jarvis
+
+# anti goals
+- depend on bloat deps for the implementation of this project
+- be compute hog
+- be api based

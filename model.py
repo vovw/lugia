@@ -1,80 +1,88 @@
-import json
-import argparse
-import time
-from pathlib import Path
-from typing import List, Optional, Tuple
 from dataclasses import dataclass
-import os
+from typing import Optional, Tuple, Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_unflatten
-from sentencepiece import SentencePieceProcessor
 
 @dataclass
-class ModelArgs:
-    dim: int
-    n_layers: int
-    head_dim: int
-    hidden_dim: int
-    n_heads: int
-    n_kv_heads: int
-    norm_eps: float
-    vocab_size: int
-    rope_theta: float = 10000
+class BaseModelArgs:
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
 
-class Mistral(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.n_layers = args.n_layers
-        assert self.vocab_size > 0
-        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        self.layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
-        self.norm = nn.RMSNorm(args.dim, eps=args.norm_eps)
-        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-    ):
-        h = self.tok_embeddings(inputs)
-
+def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
+    T = h.shape[1]
+    if T > 1:
+        if cache is not None and cache[0] is not None:
+            c = cache[0]
+            if isinstance(c, RotatingKVCache):
+                offset = min(c.max_size - 1, c.offset)
+            else:
+                offset = c.offset
+        else:
+            offset = 0
+        mask = create_additive_causal_mask(T, offset)
+        mask = mask.astype(h.dtype)
+    else:
         mask = None
-        if h.shape[1] > 1:
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
-            mask = mask.astype(h.dtype)
+    return mask
 
-        if cache is None:
-            cache = [None] * len(self.layers)
+@dataclass
+class ModelArgs(BaseModelArgs):
+    model_type: str
+    hidden_size: int
+    num_hidden_layers: int
+    intermediate_size: int
+    num_attention_heads: int
+    head_dim: int
+    rms_norm_eps: float
+    vocab_size: int
+    num_key_value_heads: int
+    rope_theta: float = 10000
+    rope_traditional: bool = False
+    attn_logit_softcapping: float = 50.0
+    final_logit_softcapping: float = 30.0
+    query_pre_attn_scalar: float = 144.0
 
-        for e, layer in enumerate(self.layers):
-            h, cache[e] = layer(h, mask, cache[e])
+class RMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.eps = eps
 
-        return self.output(self.norm(h)), cache
+    def __call__(self, x):
+        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
 
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
 
-        self.n_heads: int = args.n_heads
-        self.n_kv_heads: int = args.n_kv_heads
+        dim = args.hidden_size
+        self.n_heads = n_heads = args.num_attention_heads
+        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        self.repeats = n_heads // n_kv_heads
+        self.head_dim = head_dim = args.head_dim
 
-        self.repeats = self.n_heads // self.n_kv_heads
+        self.scale = 1.0 / (args.query_pre_attn_scalar**0.5)
 
-        self.scale = self.args.head_dim**-0.5
-
-        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
-        self.rope = nn.RoPE(args.head_dim, traditional=True, base=args.rope_theta)
-
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+        self.attn_logit_softcapping = args.attn_logit_softcapping
+        self.rope = nn.RoPE(
+            head_dim,
+            traditional=args.rope_traditional,
+            base=args.rope_theta,
+        )
     def __call__(
         self,
         x: mx.array,
@@ -82,49 +90,70 @@ class Attention(nn.Module):
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
-
-        queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
-
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            key_cache, value_cache = cache
-            queries = self.rope(queries, offset=key_cache.shape[2])
-            keys = self.rope(keys, offset=key_cache.shape[2])
-            keys = mx.concatenate([key_cache, keys], axis=2)
-            values = mx.concatenate([value_cache, values], axis=2)
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
+        queries = queries * self.scale
+
+        if self.repeats > 1:
+            queries = queries.reshape(
+                B, self.n_kv_heads, self.repeats, L, self.head_dim
+            )
+            keys = mx.expand_dims(keys, 2)
+            values = mx.expand_dims(values, 2)
+
+        scores = queries @ keys.swapaxes(-1, -2)
+        scores = mx.tanh(scores / self.attn_logit_softcapping)
+        scores *= self.attn_logit_softcapping
+
+        if mask is not None:
+            scores = scores + mask
+        scores = mx.softmax(scores, precise=True, axis=-1)
+        output = scores @ values
+        if self.repeats > 1:
+            output = output.reshape(B, self.n_heads, L, self.head_dim)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.wo(output), (keys, values)
+        return self.o_proj(output)
 
-class FeedForward(nn.Module):
-    def __init__(self, args: ModelArgs):
+
+
+class MLP(nn.Module):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
-
-        self.w1 = nn.Linear(args.dim , args.hidden_dim, bias=False)
-        self.w2 = nn.Linear(args.hidden_dim , args.dim, bias=False)
-        self.w3 = nn.Linear(args.dim , args.hidden_dim, bias=False)
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return self.down_proj(nn.gelu(self.gate_proj(x)) * self.up_proj(x))
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.attention = Attention(args)
-        self.feed_forward = FeedForward(args)
-        self.attention_norm = nn.RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(args.dim, eps=args.norm_eps)
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.self_attn = Attention(args)
+        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.args = args
 
     def __call__(
         self,
@@ -132,100 +161,74 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r, cache = self.attention(self.attention_norm(x), mask, cache)
-        h = x + r
-        r = self.feed_forward(self.ffn_norm(h))
-        out = h + r
-        return out, cache
-
-class Tokenizer:
-    def __init__(self, model_path: str):
-        assert Path(model_path).exists(), model_path
-        self._model = SentencePieceProcessor(model_file=model_path)
-        self._sep = "▁"
-        assert self._model.vocab_size() == self._model.get_piece_size()
-
-    @property
-    def eos_id(self) -> int:
-        return self._model.eos_id()
-    @property
-    def pad_id(self) -> int:
-        return self._model.pad_id()
-    def encode(self, s: str) -> List[int]:
-        return [self._model.bos_id(), *self._model.encode(s)]
-    def decode(self, t: List[int]) -> str:
-        out = self._model.decode(t)
-        if t and self._model.id_to_piece(t[0])[0] == self._sep:
-            return " " + out
+        r = self.self_attn(self.input_layernorm(x.astype(mx.float32)), mask, cache)
+        h = x + self.post_attention_layernorm(r)
+        r = self.mlp(self.pre_feedforward_layernorm(h).astype(mx.float16)).astype(
+            mx.float32
+        )
+        out = h + self.post_feedforward_layernorm(r)
         return out
 
-def load_model(folder: str):
-    model_path = Path(folder)
-    tokenizer = Tokenizer(str(model_path / "tokenizer.model"))
-    with open(model_path / "config.json", "r") as f:
-        config = json.loads(f.read())
-        config.pop("sliding_window", None)
-        config.pop("model_type", None)
-        quantization = config.pop("quantization", None)
-        model_args = ModelArgs(**config)
-    weights = mx.load(str(model_path / "weights.npz"))
-    weights = tree_unflatten(list(weights.items()))
-    model = Mistral(model_args)
-    if quantization is not None:
-        nn.quantize(model, **quantization)
-    model.update(weights)
-    mx.eval(model.parameters())
-    return model, tokenizer
 
-def generate(prompt: mx.array, model: Mistral, temp: Optional[float] = 0.0):
-    def sample(logits):
-        if temp == 0:
-            return mx.argmax(logits, axis=-1)
-        else:
-            return mx.random.categorical(logits * (1 / temp))
+class GemmaModel(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.vocab_size = args.vocab_size
+        self.num_hidden_layers = args.num_hidden_layers
+        assert self.vocab_size > 0
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [
+            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+        ]
+        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    logits, cache = model(prompt[None])
-    y = sample(logits[:, -1, :])
-    yield y
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+    ):
+        h = self.embed_tokens(inputs)
+        h = h * (self.args.hidden_size**0.5)
 
-    while True:
-        logits, cache = model(y[:, None], cache)
-        y = sample(logits.squeeze(1))
-        yield y
+        mask = create_attention_mask(h, cache)
 
-if __name__ == "__main__":
-    model_path = "mlx_model"
-    prompt = "write quicksort in python:"
-    max_tokens = 100
-    temp = 0.0
-    tokens_per_eval = 10
-    seed = 0
+        if cache is None:
+            cache = [None] * len(self.layers)
 
-    mx.random.seed(seed)
-    print("[INFO] Loading model from disk.")
-    model, tokenizer = load_model(model_path)
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
 
-    print("[INFO] Starting generation...")
-    tic = time.time()
-    print(prompt, end="", flush=True)
-    prompt_encoded = mx.array(tokenizer.encode(prompt))
-    tokens = []
-    for token, ntoks in zip(generate(prompt_encoded, model, temp), range(max_tokens)):
-        tokens.append(token)
-        if ntoks == 0:
-            mx.eval(tokens)
-            toc = time.time()
-            prompt_tps = prompt_encoded.size / (toc - tic)
-            tic = time.time()
-        if (len(tokens) % tokens_per_eval) == 0:
-            mx.eval(tokens)
-            s = tokenizer.decode([t.item() for t in tokens])
-            print(s, end="", flush=True)
-            tokens = []
+        return self.norm(h)
 
-    mx.eval(tokens)
-    s = tokenizer.decode([t.item() for t in tokens])
-    print(s, flush=True)
-    print("------")
-    generation_tps = ntoks / (time.time() - tic)
-    print(f"Tokens per second: prompt {prompt_tps:.3f}, generation {generation_tps:.3f}")
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.model_type = args.model_type
+        self.final_logit_softcapping = args.final_logit_softcapping
+        self.model = GemmaModel(args)
+        self.args = args
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+    ):
+        out = self.model(inputs, cache)
+        out = self.model.embed_tokens.as_linear(out)
+        out = mx.tanh(out / self.final_logit_softcapping)
+        out = out * self.final_logit_softcapping
+        return out
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    @property
+    def head_dim(self):
+        return self.args.head_dim
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads
