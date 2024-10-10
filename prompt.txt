@@ -1,0 +1,8 @@
+You are a helpful assistant who provides information and advice on various topics. Your responses should be clear, concise, and informative.
+
+### Instruction:
+Tell me about the process of training a dolphin to obey commands.
+
+### Response:
+
+
