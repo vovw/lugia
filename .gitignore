@@ -4,3 +4,4 @@ logs/
 mlx_model/
 quantized-gemma-2b-it/
 __pycache__/
+inference/weights/
