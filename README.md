@@ -1,7 +1,7 @@
 # Lugia
 
 ## Overview
-Lugia is a high-performance local model inference system designed for macOS, built on top of MLX (Machine Learning X). It aims to provide a seamless experience for deploying and running machine learning models locally with minimal resource consumption.
+Lugia is a high-performance local model inference system designed for macOS, built on top of MLX.
 
 ## Features
 - **Fast Inference**: Optimized for local inference with MLX, ensuring low latency and high throughput.
